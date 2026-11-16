@@ -525,28 +525,31 @@ class PayloadRepository(private val context: Context) {
         onProgress(context.getString(R.string.repo_downloading, label))
         val temporary = File(destination.parentFile, "${destination.name}.part")
         val connection = open(artifact.url)
-        require(!checked || connection.contentLengthLong == -1L || connection.contentLengthLong == artifact.size) {
-            context.getString(R.string.repo_size_mismatch, label)
-        }
         val digest = MessageDigest.getInstance("SHA-256")
         var total = 0L
-        connection.inputStream.use { input ->
-            FileOutputStream(temporary).use { output ->
-                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                while (true) {
-                    val count = input.read(buffer)
-                    if (count < 0) break
-                    total += count
-                    require(!checked || total <= artifact.size) {
-                        context.getString(R.string.repo_size_exceeded, label)
-                    }
-                    digest.update(buffer, 0, count)
-                    output.write(buffer, 0, count)
-                }
-                output.fd.sync()
+        try {
+            require(!checked || connection.contentLengthLong == -1L || connection.contentLengthLong == artifact.size) {
+                context.getString(R.string.repo_size_mismatch, label)
             }
+            connection.inputStream.use { input ->
+                FileOutputStream(temporary).use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        total += count
+                        require(!checked || total <= artifact.size) {
+                            context.getString(R.string.repo_size_exceeded, label)
+                        }
+                        digest.update(buffer, 0, count)
+                        output.write(buffer, 0, count)
+                    }
+                    output.fd.sync()
+                }
+            }
+        } finally {
+            connection.disconnect()
         }
-        connection.disconnect()
         require(!checked || total == artifact.size) {
             context.getString(R.string.repo_incomplete, label)
         }
@@ -687,41 +690,50 @@ class PayloadRepository(private val context: Context) {
 
     private fun downloadBytes(url: String, maximum: Int, accept: String? = null): ByteArray {
         val connection = open(url, accept)
-        val bytes = connection.inputStream.use { input ->
-            val output = ByteArrayOutputStream()
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                require(output.size() + count <= maximum) {
-                    context.getString(R.string.repo_response_too_large)
+        try {
+            return connection.inputStream.use { input ->
+                val output = ByteArrayOutputStream()
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    require(output.size() + count <= maximum) {
+                        context.getString(R.string.repo_response_too_large)
+                    }
+                    output.write(buffer, 0, count)
                 }
-                output.write(buffer, 0, count)
+                output.toByteArray()
             }
-            output.toByteArray()
+        } finally {
+            connection.disconnect()
         }
-        connection.disconnect()
-        return bytes
     }
 
-    private fun open(url: String, accept: String? = null): HttpURLConnection =
-        (URL(url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 15_000
-            readTimeout = 60_000
-            instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "S25URoot/${BuildConfig.VERSION_NAME}")
-            accept?.let { setRequestProperty("Accept", it) }
-            connect()
-            require(responseCode == HttpURLConnection.HTTP_OK) {
-                // A limited API answers 403 (and 429 when it is explicit about it). Reporting the
-                // status number alone sends the reader looking for a fault in their repository.
-                if (responseCode == HttpURLConnection.HTTP_FORBIDDEN || responseCode == 429) {
-                    context.getString(R.string.repo_api_limited)
-                } else {
-                    "HTTP $responseCode"
-                }
-            }
+    private fun open(url: String, accept: String? = null): HttpURLConnection {
+        val headers = buildMap {
+            if (accept != null) put("Accept", accept)
         }
+        val connection = HttpsRedirects.open(
+            url = url,
+            connectTimeoutMillis = 15_000,
+            readTimeoutMillis = 60_000,
+            userAgent = "S25URoot/${BuildConfig.VERSION_NAME}",
+            headers = headers,
+        )
+        require(connection.responseCode == HttpURLConnection.HTTP_OK) {
+            // A limited API answers 403 (and 429 when it is explicit about it). Reporting the
+            // status number alone sends the reader looking for a fault in their repository.
+            val responseCode = connection.responseCode
+            val message = if (responseCode == HttpURLConnection.HTTP_FORBIDDEN || responseCode == 429) {
+                context.getString(R.string.repo_api_limited)
+            } else {
+                "HTTP $responseCode"
+            }
+            connection.disconnect()
+            message
+        }
+        return connection
+    }
 
     companion object {
         /** Asks for the bare commit instead of the commit object, so the answer cannot grow with it. */
